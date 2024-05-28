@@ -1030,6 +1030,147 @@ namespace System.Collections.Concurrent
             }
         }
 
+        /// <summary>
+        /// Shared internal implementation for inserts and updates.
+        /// If key exists, we always return false; and if updateIfExists == true we force update with value;
+        /// If key doesn't exist, we always add value and return true;
+        /// </summary>
+        private bool TryAddInternal2(Tables tables, TKey key, int? nullableHashcode, Func<TKey, TValue> valueFactory, bool updateIfExists, bool acquireLock, out TValue resultingValue)
+        {
+            IEqualityComparer<TKey>? comparer = tables._comparer;
+
+            int hashcode = nullableHashcode ?? GetHashCode(comparer, key);
+            Debug.Assert(nullableHashcode is null || nullableHashcode == hashcode);
+
+            while (true)
+            {
+                object[] locks = tables._locks;
+                ref Node? bucket = ref GetBucketAndLock(tables, hashcode, out uint lockNo);
+
+                bool resizeDesired = false;
+                bool forceRehash = false;
+                bool lockTaken = false;
+                try
+                {
+                    if (acquireLock)
+                    {
+                        Monitor.Enter(locks[lockNo], ref lockTaken);
+                    }
+
+                    // Request the value after the lock is aquired to prevent multiple calls to the valueFactory with the same key.
+                    var value = valueFactory(key);
+                    resultingValue = value;
+
+                    // If the table just got resized, we may not be holding the right lock, and must retry.
+                    // This should be a rare occurrence.
+                    if (tables != _tables)
+                    {
+                        tables = _tables;
+                        if (!ReferenceEquals(comparer, tables._comparer))
+                        {
+                            comparer = tables._comparer;
+                            hashcode = GetHashCode(comparer, key);
+                        }
+                        continue;
+                    }
+
+                    // Try to find this key in the bucket
+                    uint collisionCount = 0;
+                    Node? prev = null;
+                    for (Node? node = bucket; node is not null; node = node._next)
+                    {
+                        Debug.Assert((prev is null && node == bucket) || prev!._next == node);
+                        if (hashcode == node._hashcode && NodeEqualsKey(comparer, node, key))
+                        {
+                            // The key was found in the dictionary. If updates are allowed, update the value for that key.
+                            // We need to create a new node for the update, in order to support TValue types that cannot
+                            // be written atomically, since lock-free reads may be happening concurrently.
+                            if (updateIfExists)
+                            {
+                                // Do the reference type check up front to handle many cases of shared generics.
+                                // If TValue is a value type then the field's value here can be baked in. Otherwise,
+                                // for the remaining shared generic cases the field access here would disqualify inlining,
+                                // so the following check cannot be factored out of TryAddInternal/TryUpdateInternal.
+                                if (!typeof(TValue).IsValueType || ConcurrentDictionaryTypeProps<TValue>.IsWriteAtomic)
+                                {
+                                    node._value = value;
+                                }
+                                else
+                                {
+                                    var newNode = new Node(node._key, value, hashcode, node._next);
+                                    if (prev is null)
+                                    {
+                                        Volatile.Write(ref bucket, newNode);
+                                    }
+                                    else
+                                    {
+                                        prev._next = newNode;
+                                    }
+                                }
+                                resultingValue = value;
+                            }
+                            else
+                            {
+                                resultingValue = node._value;
+                            }
+                            return false;
+                        }
+                        prev = node;
+                        if (!typeof(TKey).IsValueType) // this is only relevant to strings, and we can avoid this code for all value types
+                        {
+                            collisionCount++;
+                        }
+                    }
+
+                    // The key was not found in the bucket. Insert the key-value pair.
+                    var resultNode = new Node(key, value, hashcode, bucket);
+                    Volatile.Write(ref bucket, resultNode);
+                    checked
+                    {
+                        tables._countPerLock[lockNo]++;
+                    }
+
+                    // If the number of elements guarded by this lock has exceeded the budget, resize the bucket table.
+                    // It is also possible that GrowTable will increase the budget but won't resize the bucket table.
+                    // That happens if the bucket table is found to be poorly utilized due to a bad hash function.
+                    if (tables._countPerLock[lockNo] > _budget)
+                    {
+                        resizeDesired = true;
+                    }
+
+                    // We similarly want to invoke redo the tables if we're using a non-randomized comparer
+                    // and need to upgrade to a randomized comparer due to too many collisions.
+                    if (!typeof(TKey).IsValueType &&
+                        collisionCount > HashHelpers.HashCollisionThreshold &&
+                        comparer is NonRandomizedStringEqualityComparer)
+                    {
+                        forceRehash = true;
+                    }
+                }
+                finally
+                {
+                    if (lockTaken)
+                    {
+                        Monitor.Exit(locks[lockNo]);
+                    }
+                }
+
+                // The fact that we got here means that we just performed an insertion. If necessary, we will grow the table.
+                //
+                // Concurrency notes:
+                // - Notice that we are not holding any locks at when calling GrowTable. This is necessary to prevent deadlocks.
+                // - As a result, it is possible that GrowTable will be called unnecessarily. But, GrowTable will obtain lock 0
+                //   and then verify that the table we passed to it as the argument is still the current table.
+                if (resizeDesired | forceRehash)
+                {
+                    GrowTable(tables, resizeDesired, forceRehash);
+                }
+
+                return true;
+            }
+        }
+
+
         /// <summary>Gets or sets the value associated with the specified key.</summary>
         /// <param name="key">The key of the value to get or set.</param>
         /// <value>
@@ -1178,7 +1319,7 @@ namespace System.Collections.Concurrent
 
             if (!TryGetValueInternal(tables, key, hashcode, out TValue? resultingValue))
             {
-                TryAddInternal(tables, key, hashcode, valueFactory(key), updateIfExists: false, acquireLock: true, out resultingValue);
+                TryAddInternal2(tables, key, hashcode, valueFactory, updateIfExists: false, acquireLock: true, out resultingValue);
             }
 
             return resultingValue;
